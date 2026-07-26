@@ -3,6 +3,7 @@ package io.apicurio.registry.rest.wellknown;
 import io.apicurio.registry.a2a.rest.beans.AgentCard;
 import io.apicurio.registry.a2a.rest.beans.AgentSearchRequest;
 import io.apicurio.registry.a2a.rest.beans.AgentSearchResults;
+import io.apicurio.registry.mcptools.rest.beans.CompatibleMcpToolResults;
 import io.apicurio.registry.mcptools.rest.beans.McpToolSearchResults;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DefaultValue;
@@ -166,6 +167,30 @@ public interface WellKnownResource {
     McpToolSearchResults searchMcpTools(
             @QueryParam("name") String name,
             @QueryParam("parameter") List<String> parameters,
+            @QueryParam("offset") @DefaultValue("0") Integer offset,
+            @QueryParam("limit") @DefaultValue("20") Integer limit);
+
+    /**
+     * Finds registered MCP tools whose input can be driven by the output of the given source tool.
+     * In other words, tools that can be chained after the source tool: the source tool's
+     * {@code outputSchema} satisfies each candidate tool's required {@code inputSchema} parameters.
+     *
+     * This powers "what can I run next?" discovery when composing MCP tools into a pipeline.
+     *
+     * @param groupId the group ID of the source MCP tool
+     * @param artifactId the artifact ID of the source MCP tool
+     * @param version optional version of the source tool (defaults to latest)
+     * @param offset pagination offset
+     * @param limit pagination limit
+     * @return the compatible tools, each with an explanation of which parameters matched
+     */
+    @GET
+    @Path("/mcp-tools/{groupId}/{artifactId}/compatible-tools")
+    @Produces(MediaType.APPLICATION_JSON)
+    CompatibleMcpToolResults findCompatibleMcpTools(
+            @PathParam("groupId") String groupId,
+            @PathParam("artifactId") String artifactId,
+            @QueryParam("version") String version,
             @QueryParam("offset") @DefaultValue("0") Integer offset,
             @QueryParam("limit") @DefaultValue("20") Integer limit);
 

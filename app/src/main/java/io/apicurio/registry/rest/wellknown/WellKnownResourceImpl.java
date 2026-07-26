@@ -17,8 +17,12 @@ import io.apicurio.registry.auth.Authorized;
 import io.apicurio.registry.auth.AuthorizedLevel;
 import io.apicurio.registry.auth.AuthorizedStyle;
 import io.apicurio.registry.mcptools.McpToolsConfig;
+import io.apicurio.registry.mcptools.rest.beans.CompatibleMcpToolResult;
+import io.apicurio.registry.mcptools.rest.beans.CompatibleMcpToolResults;
 import io.apicurio.registry.mcptools.rest.beans.McpToolSearchResult;
 import io.apicurio.registry.mcptools.rest.beans.McpToolSearchResults;
+import io.apicurio.registry.rules.compatibility.McpToolChainCompatibility;
+import io.apicurio.registry.rules.compatibility.McpToolChainCompatibilityResult;
 import io.apicurio.registry.cdi.Current;
 import io.apicurio.registry.logging.Logged;
 import io.apicurio.registry.metrics.health.liveness.ResponseErrorLivenessCheck;
@@ -59,6 +63,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -76,6 +81,11 @@ public class WellKnownResourceImpl implements WellKnownResource {
     private static final ObjectMapper mapper = new ObjectMapper();
 
     private static final int MAX_VISIBILITY_FILTER_RESULTS = 10000;
+
+    // Upper bound on how many MCP tools are scanned as chaining candidates for a single
+    // compatible-tools query. MCP tool discovery is an experimental feature with modest catalog
+    // sizes; this keeps the in-memory analysis bounded.
+    private static final int MAX_COMPATIBLE_TOOL_CANDIDATES = 1000;
 
     @Inject
     A2AConfig a2aConfig;
@@ -600,6 +610,135 @@ public class WellKnownResourceImpl implements WellKnownResource {
                 .createdOn(artifact.getCreatedOn().getTime())
                 .parameters(parameters)
                 .build();
+    }
+
+    @Override
+    @Authorized(style = AuthorizedStyle.GroupAndArtifact, level = AuthorizedLevel.Read)
+    public CompatibleMcpToolResults findCompatibleMcpTools(String groupId, String artifactId,
+            String version, Integer offset, Integer limit) {
+        if (!mcpToolsConfig.isEnabled()) {
+            throw new NotFoundException("MCP tools support is disabled");
+        }
+
+        // Resolve and parse the source tool: the producer whose output we want to chain from.
+        JsonNode sourceTool = parseMcpTool(resolveMcpToolContent(groupId, artifactId, version));
+
+        // Gather candidate MCP tools (bounded) and keep those the source tool can drive.
+        Set<SearchFilter> filters = new HashSet<>();
+        filters.add(SearchFilter.ofArtifactType(ArtifactType.MCP_TOOL));
+        ArtifactSearchResultsDto candidates = storage.searchArtifacts(filters, OrderBy.createdOn,
+                OrderDirection.desc, 0, MAX_COMPATIBLE_TOOL_CANDIDATES, false);
+
+        String sourceRawGroupId = new GroupId(groupId).getRawGroupIdWithNull();
+
+        List<CompatibleMcpToolResult> compatible = new ArrayList<>();
+        for (SearchedArtifactDto candidate : candidates.getArtifacts()) {
+            // A tool never chains to itself.
+            if (Objects.equals(candidate.getGroupId(), sourceRawGroupId)
+                    && Objects.equals(candidate.getArtifactId(), artifactId)) {
+                continue;
+            }
+
+            JsonNode candidateTool = loadLatestMcpToolContent(candidate.getGroupId(),
+                    candidate.getArtifactId());
+            if (candidateTool == null) {
+                continue;
+            }
+
+            McpToolChainCompatibilityResult analysis =
+                    McpToolChainCompatibility.analyze(sourceTool, candidateTool);
+            if (!analysis.isCompatible()) {
+                continue;
+            }
+
+            compatible.add(CompatibleMcpToolResult.builder()
+                    .groupId(candidate.getGroupId())
+                    .artifactId(candidate.getArtifactId())
+                    .name(candidate.getName())
+                    .title(textField(candidateTool, "title"))
+                    .description(candidate.getDescription())
+                    .matchedParameters(analysis.getMatchedRequiredParameters())
+                    .optionalParameters(analysis.getMatchedOptionalParameters())
+                    .build());
+        }
+
+        // Page the in-memory list of compatible tools.
+        long total = compatible.size();
+        return CompatibleMcpToolResults.builder()
+                .count(total)
+                .tools(paginate(compatible, offset, limit))
+                .build();
+    }
+
+    /**
+     * Resolves the content of an MCP tool artifact, verifying it is actually an MCP tool.
+     *
+     * @throws NotFoundException if the artifact does not exist or is not an MCP tool definition
+     */
+    private String resolveMcpToolContent(String groupId, String artifactId, String version) {
+        GA ga = new GA(new GroupId(groupId).getRawGroupIdWithNull(), artifactId);
+        try {
+            String versionExpression = StringUtil.isEmpty(version) ? "branch=latest" : version;
+            GAV gav = VersionExpressionParser.parse(ga, versionExpression,
+                    (g, branchId) -> storage.getBranchTip(g, branchId,
+                            RetrievalBehavior.SKIP_DISABLED_LATEST));
+
+            ArtifactVersionMetaDataDto metadata = storage.getArtifactVersionMetaData(
+                    gav.getRawGroupIdWithNull(), gav.getRawArtifactId(), gav.getRawVersionId());
+            if (!ArtifactType.MCP_TOOL.equals(metadata.getArtifactType())) {
+                throw new NotFoundException("Artifact is not an MCP tool definition");
+            }
+
+            StoredArtifactVersionDto stored = storage.getArtifactVersionContent(
+                    gav.getRawGroupIdWithNull(), gav.getRawArtifactId(), gav.getRawVersionId());
+            return stored.getContent().content();
+        } catch (ArtifactNotFoundException | VersionNotFoundException e) {
+            throw new NotFoundException("MCP tool not found: " + groupId + "/" + artifactId);
+        }
+    }
+
+    /**
+     * Loads and parses the latest version content of a candidate MCP tool, returning {@code null}
+     * (rather than failing the whole query) if it cannot be read or parsed.
+     */
+    private JsonNode loadLatestMcpToolContent(String rawGroupId, String artifactId) {
+        try {
+            GA ga = new GA(rawGroupId, artifactId);
+            GAV gav = VersionExpressionParser.parse(ga, "branch=latest",
+                    (g, branchId) -> storage.getBranchTip(g, branchId,
+                            RetrievalBehavior.SKIP_DISABLED_LATEST));
+            StoredArtifactVersionDto stored = storage.getArtifactVersionContent(
+                    gav.getRawGroupIdWithNull(), gav.getRawArtifactId(), gav.getRawVersionId());
+            return mapper.readTree(stored.getContent().content());
+        } catch (Exception e) {
+            log.warn("Failed to load MCP tool content for {}/{}: {}", rawGroupId, artifactId,
+                    e.getMessage());
+            return null;
+        }
+    }
+
+    private JsonNode parseMcpTool(String content) {
+        try {
+            return mapper.readTree(content);
+        } catch (Exception e) {
+            throw new NotFoundException("MCP tool content could not be parsed");
+        }
+    }
+
+    private static String textField(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        return value != null && value.isTextual() ? value.asText() : null;
+    }
+
+    private static List<CompatibleMcpToolResult> paginate(List<CompatibleMcpToolResult> items,
+            Integer offset, Integer limit) {
+        int off = offset == null || offset < 0 ? 0 : offset;
+        int lim = limit == null || limit < 0 ? 20 : limit;
+        if (off >= items.size()) {
+            return List.of();
+        }
+        int end = Math.min(items.size(), off + lim);
+        return new ArrayList<>(items.subList(off, end));
     }
 
     @Override
