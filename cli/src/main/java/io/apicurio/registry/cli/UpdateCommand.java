@@ -117,6 +117,8 @@ public class UpdateCommand extends AbstractCommand {
     private void handlePathInstall(OutputBuffer output) throws Exception {
         // Use the current binary's home (always set by the acr launcher) rather than ACR_HOME, which
         // is only exported into a shell for per-user installs; a global install has no sourced env.
+        // For a per-user install the two resolve to the same directory, so existing behaviour is
+        // unchanged; this only makes the download scratch dir resolvable for global installs too.
         var homePath = config.getAcrCurrentHomePath();
         var targetDir = homePath.resolve(UUID.randomUUID().toString().substring(0, 8));
         try {
@@ -130,7 +132,8 @@ public class UpdateCommand extends AbstractCommand {
     }
 
     private void handleAutoUpdate(OutputBuffer output, CliVersion currentVersion) throws Exception {
-        // See handlePathInstall: use the current binary's home so updates work for global installs too.
+        // See handlePathInstall: use the current binary's home so updates work for global installs
+        // too. Equivalent to ACR_HOME for a per-user install, so the existing update path is unchanged.
         var homePath = config.getAcrCurrentHomePath();
 
         String versionToDownload;
@@ -180,15 +183,7 @@ public class UpdateCommand extends AbstractCommand {
             }
         }
         log.debugf("Running subprocess: %s", acrPath);
-        var cmd = new ArrayList<String>(4);
-        cmd.add(acrPath.toString());
-        cmd.add("install");
-        if (isGlobalInstall()) {
-            cmd.add("--global");
-        }
-        if (parent.isVerbose()) {
-            cmd.add("--verbose");
-        }
+        var cmd = buildInstallCommand(acrPath);
         ProcessBuilder processBuilder = new ProcessBuilder(cmd);
         processBuilder.inheritIO();
         Process process = processBuilder.start();
@@ -202,9 +197,31 @@ public class UpdateCommand extends AbstractCommand {
     }
 
     /**
+     * Builds the argument list for the {@code acr install} subprocess that performs the actual
+     * update, forwarding {@code --global} when the current installation is global so the re-install
+     * keeps the same scope.
+     */
+    List<String> buildInstallCommand(Path acrPath) {
+        var cmd = new ArrayList<String>(4);
+        cmd.add(acrPath.toString());
+        cmd.add("install");
+        if (isGlobalInstall()) {
+            cmd.add("--global");
+        }
+        // parent is null only in unit tests that build the command directly (never during parsing).
+        if (parent != null && parent.isVerbose()) {
+            cmd.add("--verbose");
+        }
+        return cmd;
+    }
+
+    /**
      * Detects whether the current installation was performed globally, so the re-install triggered
-     * by an update keeps the same system-wide scope. Best-effort: any failure to read the config
-     * (for example a per-user install with no marker) is treated as a per-user installation.
+     * by an update keeps the same system-wide scope. The marker is read via {@link Config#read()},
+     * which resolves {@code config.json} under {@code getAcrCurrentHomePath()} (the running binary's
+     * own home), so it correctly finds the marker a global install wrote even though {@code ACR_HOME}
+     * is never exported for a global install. Best-effort: any failure to read the config (for
+     * example a per-user install with no marker) is treated as a per-user installation.
      */
     private boolean isGlobalInstall() {
         try {

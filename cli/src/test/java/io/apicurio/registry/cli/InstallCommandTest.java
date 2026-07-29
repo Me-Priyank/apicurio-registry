@@ -1,11 +1,13 @@
 package io.apicurio.registry.cli;
 
+import io.apicurio.registry.cli.common.CliException;
 import io.apicurio.registry.cli.config.Config;
 import io.apicurio.registry.cli.config.ConfigModel;
 import io.apicurio.registry.cli.utils.Mapper;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledOnOs;
@@ -242,6 +244,45 @@ public class InstallCommandTest {
         assertThat(Files.readString(shellConfig))
             .as("A global install must not modify the user's shell configuration")
             .doesNotContain(ACR_ENV);
+    }
+
+    @Test
+    @EnabledOnOs({OS.MAC, OS.LINUX})
+    public void testGlobalInstallWithoutPrivilegesFailsWithClearError() throws Exception {
+        // The privilege check relies on the process not being able to write to the target dir, which
+        // is not true for root, so skip there rather than assert a check that cannot fire.
+        Assumptions.assumeFalse("root".equals(System.getProperty("user.name")),
+                "Privilege check cannot be exercised as root");
+
+        final Path globalHome = tempDir.resolve("global-home");
+        final Path readOnlyBin = tempDir.resolve("readonly-bin");
+        Files.createDirectories(readOnlyBin);
+        assertThat(readOnlyBin.toFile().setWritable(false, false))
+            .as("test setup: the bin directory must be made read-only")
+            .isTrue();
+
+        config.setEnvOverride(ENV_ACR_GLOBAL_HOME, globalHome.toString());
+        config.setEnvOverride(ENV_ACR_GLOBAL_BIN, readOnlyBin.toString());
+
+        final StringBuilder err = new StringBuilder();
+        final var originalErr = config.getStdErr();
+        config.setStdErr(err::append);
+        try {
+            final int exitCode = new CommandLine(new Acr(), factory).execute("install", "--global");
+
+            assertThat(exitCode)
+                .as("Install without write access should return the validation error code")
+                .isEqualTo(CliException.VALIDATION_ERROR_RETURN_CODE);
+            assertThat(err.toString())
+                .as("The error should tell the user to re-run with sudo")
+                .contains("sudo");
+            assertThat(globalHome)
+                .as("Nothing should be installed when the privilege check fails")
+                .doesNotExist();
+        } finally {
+            config.setStdErr(originalErr);
+            readOnlyBin.toFile().setWritable(true, false);
+        }
     }
 
     @Test

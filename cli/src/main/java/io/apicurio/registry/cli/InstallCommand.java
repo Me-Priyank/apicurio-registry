@@ -155,6 +155,11 @@ public class InstallCommand extends AbstractCommand {
     /**
      * Returns true when the directory (or, when it does not exist yet, the nearest existing ancestor
      * that would have to be created) is writable by the current process.
+     *
+     * This is a best-effort heuristic, not a guarantee: {@link Files#isWritable} can diverge from the
+     * real outcome (for example a broadly world-writable ancestor, or ownership/ACL quirks). It exists
+     * only to turn the common "not root" case into a clear, actionable message up front; the actual
+     * file operations still fail loudly if the heuristic is wrong.
      */
     private static boolean isWritableLocation(final Path dir) {
         Path probe = dir;
