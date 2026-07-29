@@ -115,7 +115,9 @@ public class UpdateCommand extends AbstractCommand {
     }
 
     private void handlePathInstall(OutputBuffer output) throws Exception {
-        var homePath = config.getAcrHomePath();
+        // Use the current binary's home (always set by the acr launcher) rather than ACR_HOME, which
+        // is only exported into a shell for per-user installs; a global install has no sourced env.
+        var homePath = config.getAcrCurrentHomePath();
         var targetDir = homePath.resolve(UUID.randomUUID().toString().substring(0, 8));
         try {
             Files.createDirectories(targetDir);
@@ -128,7 +130,8 @@ public class UpdateCommand extends AbstractCommand {
     }
 
     private void handleAutoUpdate(OutputBuffer output, CliVersion currentVersion) throws Exception {
-        var homePath = config.getAcrHomePath();
+        // See handlePathInstall: use the current binary's home so updates work for global installs too.
+        var homePath = config.getAcrCurrentHomePath();
 
         String versionToDownload;
         if (targetVersion != null) {
@@ -177,9 +180,12 @@ public class UpdateCommand extends AbstractCommand {
             }
         }
         log.debugf("Running subprocess: %s", acrPath);
-        var cmd = new ArrayList<String>(3);
+        var cmd = new ArrayList<String>(4);
         cmd.add(acrPath.toString());
         cmd.add("install");
+        if (isGlobalInstall()) {
+            cmd.add("--global");
+        }
         if (parent.isVerbose()) {
             cmd.add("--verbose");
         }
@@ -193,6 +199,20 @@ public class UpdateCommand extends AbstractCommand {
         }
 
         output.writeStdOutLine("Update complete.");
+    }
+
+    /**
+     * Detects whether the current installation was performed globally, so the re-install triggered
+     * by an update keeps the same system-wide scope. Best-effort: any failure to read the config
+     * (for example a per-user install with no marker) is treated as a per-user installation.
+     */
+    private boolean isGlobalInstall() {
+        try {
+            return Boolean.parseBoolean(config.read().getConfig().get(InstallCommand.CONFIG_KEY_GLOBAL_INSTALL));
+        } catch (RuntimeException e) {
+            log.debugf("Could not determine install scope, assuming per-user: %s", e.getMessage());
+            return false;
+        }
     }
 
 }
